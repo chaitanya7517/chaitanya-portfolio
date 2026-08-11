@@ -2,71 +2,61 @@
 // sees this function's JSON response, never this source code or the API keys.
 
 import { randomUUID } from "node:crypto";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 
-const LANGFUSE_HOST = process.env.LANGFUSE_HOST || "https://cloud.langfuse.com";
+// Set up the Langfuse OTel span processor once per warm function instance.
+// Returns null (tracing disabled) if the keys aren't configured yet.
+let langfuseSpanProcessor;
+let langfuseInitAttempted = false;
+function getLangfuseSpanProcessor() {
+  if (langfuseInitAttempted) return langfuseSpanProcessor;
+  langfuseInitAttempted = true;
+  if (!process.env.LANGFUSE_PUBLIC_KEY || !process.env.LANGFUSE_SECRET_KEY) return null;
 
-// Fire-and-await trace of one chat turn to Langfuse. No-ops silently if the
-// keys aren't configured yet, and never lets a tracing failure break the reply.
-async function traceToLangfuse({ sessionId, input, output, model, usage, startTime, endTime }) {
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-  const secretKey = process.env.LANGFUSE_SECRET_KEY;
-  if (!publicKey || !secretKey) return;
+  langfuseSpanProcessor = new LangfuseSpanProcessor({ exportMode: "immediate" });
+  const provider = new NodeTracerProvider({ spanProcessors: [langfuseSpanProcessor] });
+  provider.register();
+  return langfuseSpanProcessor;
+}
 
-  const traceId = randomUUID();
-  const auth = Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
-  const now = new Date().toISOString();
-
-  const batch = [
-    {
-      id: randomUUID(),
-      type: "trace-create",
-      timestamp: now,
-      body: {
-        id: traceId,
-        name: "portfolio-chat",
-        sessionId,
-        input,
-        output,
-        tags: ["portfolio-site"],
-      },
-    },
-    {
-      id: randomUUID(),
-      type: "generation-create",
-      timestamp: now,
-      body: {
-        id: randomUUID(),
-        traceId,
-        name: "openai-chat-completion",
-        model,
-        input,
-        output,
-        startTime,
-        endTime,
-        usage: usage
-          ? {
-              input: usage.prompt_tokens,
-              output: usage.completion_tokens,
-              total: usage.total_tokens,
-              unit: "TOKENS",
-            }
-          : undefined,
-      },
-    },
-  ];
-
-  try {
-    await fetch(`${LANGFUSE_HOST}/api/public/ingestion`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Basic ${auth}`,
-      },
-      body: JSON.stringify({ batch }),
-    });
-  } catch (err) {
-    // tracing must never break the chat response
+class UpstreamError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
   }
+}
+
+async function callOpenAI({ model, systemPrompt, message }) {
+  const completion = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: message },
+      ],
+      max_tokens: 400,
+      temperature: 0.4,
+    }),
+  });
+
+  if (!completion.ok) {
+    throw new UpstreamError(502, "Upstream error");
+  }
+
+  const data = await completion.json();
+  const reply = data.choices?.[0]?.message?.content;
+  if (!reply) {
+    throw new UpstreamError(502, "No reply generated");
+  }
+
+  return { reply, usage: data.usage };
 }
 
 const MY_PROFILE = `
@@ -169,48 +159,55 @@ export default async function handler(req, res) {
   const trimmedMessage = message.trim();
   const resolvedSessionId = typeof sessionId === "string" && sessionId ? sessionId : randomUUID();
   const model = "gpt-4o-mini";
-  const startTime = new Date().toISOString();
+  const spanProcessor = getLangfuseSpanProcessor();
 
   try {
-    const completion = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: MY_PROFILE },
-          { role: "user", content: trimmedMessage },
-        ],
-        max_tokens: 400,
-        temperature: 0.4,
-      }),
-    });
+    let result;
 
-    if (!completion.ok) {
-      return res.status(502).json({ error: "Upstream error" });
+    if (spanProcessor) {
+      result = await propagateAttributes(
+        { sessionId: resolvedSessionId, tags: ["portfolio-site"] },
+        () =>
+          startActiveObservation("portfolio-chat", async (span) => {
+            span.update({ input: trimmedMessage });
+            const generation = span.startObservation(
+              "openai-chat-completion",
+              { model, input: trimmedMessage },
+              { asType: "generation" }
+            );
+            try {
+              const r = await callOpenAI({ model, systemPrompt: MY_PROFILE, message: trimmedMessage });
+              generation.update({
+                output: r.reply,
+                usageDetails: r.usage
+                  ? {
+                      input: r.usage.prompt_tokens,
+                      output: r.usage.completion_tokens,
+                      total: r.usage.total_tokens,
+                    }
+                  : undefined,
+              });
+              span.update({ output: r.reply });
+              return r;
+            } catch (err) {
+              generation.update({ level: "ERROR", statusMessage: err.message });
+              span.update({ level: "ERROR" });
+              throw err;
+            } finally {
+              generation.end();
+            }
+          })
+      );
+      await spanProcessor.forceFlush();
+    } else {
+      result = await callOpenAI({ model, systemPrompt: MY_PROFILE, message: trimmedMessage });
     }
 
-    const data = await completion.json();
-    const reply = data.choices?.[0]?.message?.content;
-    if (!reply) {
-      return res.status(502).json({ error: "No reply generated" });
-    }
-
-    await traceToLangfuse({
-      sessionId: resolvedSessionId,
-      input: trimmedMessage,
-      output: reply,
-      model,
-      usage: data.usage,
-      startTime,
-      endTime: new Date().toISOString(),
-    });
-
-    return res.status(200).json({ reply });
+    return res.status(200).json({ reply: result.reply });
   } catch (err) {
+    if (err instanceof UpstreamError) {
+      return res.status(err.status).json({ error: err.message });
+    }
     return res.status(500).json({ error: "Something went wrong" });
   }
 }
