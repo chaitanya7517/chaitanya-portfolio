@@ -856,6 +856,12 @@
     var input = document.getElementById('chatInput');
     var send = document.getElementById('chatSend');
 
+    var sessionId = sessionStorage.getItem('chatSessionId');
+    if(!sessionId){
+      sessionId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('sess-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+      sessionStorage.setItem('chatSessionId', sessionId);
+    }
+
     function toggle(open){
       var willOpen = open !== undefined ? open : !panel.classList.contains('open');
       panel.classList.toggle('open', willOpen);
@@ -887,7 +893,7 @@
       fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: msg })
+        body: JSON.stringify({ message: msg, sessionId: sessionId })
       })
       .then(function(r){ return r.json().then(function(data){ return { ok: r.ok, data: data }; }); })
       .then(function(res){

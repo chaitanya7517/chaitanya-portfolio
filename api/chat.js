@@ -1,5 +1,73 @@
 // api/chat.js — runs privately on Vercel's servers. The browser only ever
-// sees this function's JSON response, never this source code or the API key.
+// sees this function's JSON response, never this source code or the API keys.
+
+import { randomUUID } from "node:crypto";
+
+const LANGFUSE_HOST = process.env.LANGFUSE_HOST || "https://cloud.langfuse.com";
+
+// Fire-and-await trace of one chat turn to Langfuse. No-ops silently if the
+// keys aren't configured yet, and never lets a tracing failure break the reply.
+async function traceToLangfuse({ sessionId, input, output, model, usage, startTime, endTime }) {
+  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
+  const secretKey = process.env.LANGFUSE_SECRET_KEY;
+  if (!publicKey || !secretKey) return;
+
+  const traceId = randomUUID();
+  const auth = Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
+  const now = new Date().toISOString();
+
+  const batch = [
+    {
+      id: randomUUID(),
+      type: "trace-create",
+      timestamp: now,
+      body: {
+        id: traceId,
+        name: "portfolio-chat",
+        sessionId,
+        input,
+        output,
+        tags: ["portfolio-site"],
+      },
+    },
+    {
+      id: randomUUID(),
+      type: "generation-create",
+      timestamp: now,
+      body: {
+        id: randomUUID(),
+        traceId,
+        name: "openai-chat-completion",
+        model,
+        input,
+        output,
+        startTime,
+        endTime,
+        usage: usage
+          ? {
+              input: usage.prompt_tokens,
+              output: usage.completion_tokens,
+              total: usage.total_tokens,
+              unit: "TOKENS",
+            }
+          : undefined,
+      },
+    },
+  ];
+
+  try {
+    await fetch(`${LANGFUSE_HOST}/api/public/ingestion`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Basic ${auth}`,
+      },
+      body: JSON.stringify({ batch }),
+    });
+  } catch (err) {
+    // tracing must never break the chat response
+  }
+}
 
 const MY_PROFILE = `
 You are answering questions on behalf of Chaitanya Nalawade, a QA Automation
@@ -86,7 +154,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { message } = req.body || {};
+  const { message, sessionId } = req.body || {};
   if (typeof message !== "string" || !message.trim()) {
     return res.status(400).json({ error: "Missing message" });
   }
@@ -98,6 +166,11 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Server not configured" });
   }
 
+  const trimmedMessage = message.trim();
+  const resolvedSessionId = typeof sessionId === "string" && sessionId ? sessionId : randomUUID();
+  const model = "gpt-4o-mini";
+  const startTime = new Date().toISOString();
+
   try {
     const completion = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -106,10 +179,10 @@ export default async function handler(req, res) {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model,
         messages: [
           { role: "system", content: MY_PROFILE },
-          { role: "user", content: message.trim() },
+          { role: "user", content: trimmedMessage },
         ],
         max_tokens: 400,
         temperature: 0.4,
@@ -125,6 +198,16 @@ export default async function handler(req, res) {
     if (!reply) {
       return res.status(502).json({ error: "No reply generated" });
     }
+
+    await traceToLangfuse({
+      sessionId: resolvedSessionId,
+      input: trimmedMessage,
+      output: reply,
+      model,
+      usage: data.usage,
+      startTime,
+      endTime: new Date().toISOString(),
+    });
 
     return res.status(200).json({ reply });
   } catch (err) {
